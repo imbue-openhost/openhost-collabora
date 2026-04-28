@@ -1,0 +1,8 @@
+[app]
+name = "collabora"
+version = "0.1.0"
+description = "Collabora Online (CODE) backend — serves the in-browser office editor over WOPI; pair with a WOPI host like Nextcloud."
+
+[runtime.container]
+image = "Dockerfile"
+port = 9980
