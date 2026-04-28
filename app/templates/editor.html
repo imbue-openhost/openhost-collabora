@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ file.name }} — Collabora</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+    #frameholder { width: 100%; height: 100%; border: none; }
+    /* The iframe is what the user actually sees once Collabora loads. */
+    iframe#cool-iframe { display: block; width: 100%; height: 100%; border: 0; }
+  </style>
+</head>
+<body>
+  <!--
+    Collabora docs recommend POSTing the access_token to the editor URL via
+    a hidden form rather than putting it in the query string, so it doesn't
+    end up in browser history / referrer logs.  The form auto-submits and
+    its target is the iframe; the result is that the iframe loads cool.html
+    with the token in its POST body, and the GET-style WOPISrc query param
+    points back at our /wopi/files/<id> handler.
+  -->
+  <form id="cool-form" action="{{ cool_url }}" method="POST" target="cool-iframe" style="display:none">
+    <input type="hidden" name="access_token" value="{{ access_token }}" />
+    <input type="hidden" name="permission" value="edit" />
+    <input type="hidden" name="lang" value="en" />
+  </form>
+  <iframe id="cool-iframe" name="cool-iframe" allow="clipboard-read; clipboard-write" allowfullscreen></iframe>
+  <script>
+    document.getElementById("cool-form").submit();
+  </script>
+</body>
+</html>

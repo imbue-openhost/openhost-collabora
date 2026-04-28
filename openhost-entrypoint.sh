@@ -1,52 +1,57 @@
-#!/bin/sh
-# Wrapper around upstream /start-collabora-online.sh that:
-#   1. Builds the public FQDN OpenHost would inject if it had a hostname env
-#      var (it doesn't yet — see openhost/docs/manifest_spec.md).  We derive it
-#      from OPENHOST_APP_NAME + OPENHOST_ZONE_DOMAIN, both of which the router
-#      DOES inject.  ``server_name`` is what coolwsd publishes in its
-#      ``/hosting/discovery`` payload, so it has to be the URL the WOPI host
-#      will reach us at, not whatever the container thinks its own hostname is.
+#!/bin/bash
+# Two-process supervisor for the Collabora-with-UI image.
 #
-#   2. Forces SSL termination mode.  OpenHost terminates TLS in Caddy and
-#      proxies plain HTTP to the container; coolwsd needs to know the upstream
-#      scheme is https so its self-built links and HSTS logic stay correct.
+# Children:
+#   1. coolwsd  (Collabora's editor backend)        — listens 127.0.0.1:9980
+#   2. hypercorn → Quart UI + WOPI host + proxy    — listens 0.0.0.0:8080
 #
-#   3. Disables the capabilities-based jail.  Rootless podman cannot grant
-#      ``CAP_SYS_ADMIN`` and OpenHost's seccomp profile is not customisable,
-#      so the upstream ``mount_namespaces`` / ``capabilities`` jail can't
-#      initialise.  We fall back to user-namespace isolation only.  See the
-#      Dockerfile comment for the security trade-off.
+# Why bash and not supervisord/s6:
+#   This is a two-process supervisor that exists only to forward SIGTERM
+#   and exit when either child dies.  A 30-line bash script is easier to
+#   read and audit than another tool's config file, and there is no
+#   restart logic to get wrong.  If either child crashes the whole
+#   container exits and OpenHost reschedules.
 #
-#   4. Permits the OpenHost router as a WOPI host out of the box for smoke
-#      testing.  Operators MUST add their real WOPI host (Nextcloud, etc.) to
-#      ``WOPI_HOST_REGEX`` for production use.
+# coolwsd's start-collabora-online.sh is preserved as the launcher for
+# child 1 because we still want its ssl-cert-skip logic and "$extra_params"
+# contract.  We override its config via $extra_params so it binds to
+# loopback only, since the Quart proxy is what's exposed to the world.
 #
-# This script intentionally does no state-persisting work — coolwsd has no
-# meaningful per-instance state besides its WOPI proof key, and we let the
-# upstream image's default (regenerate on each container start) stand.
+# Bash strict mode keeps a missing executable from silently degrading the
+# container into a half-working state.
 
-set -eu
+set -euo pipefail
 
 ZONE_DOMAIN="${OPENHOST_ZONE_DOMAIN:-localhost}"
 APP_NAME="${OPENHOST_APP_NAME:-collabora}"
 SERVER_NAME="${APP_NAME}.${ZONE_DOMAIN}"
 
-# WOPI hosts the editor will accept document load requests from.  Default is
-# every host in the same zone domain so a co-located Nextcloud install works
-# without manual config.  Override with WOPI_HOST_REGEX to allow remote WOPI
-# hosts.  We escape the zone domain via sed (POSIX-portable; bash pattern
-# substitution would fail on dash, which is debian:stable-slim's /bin/sh).
+# WOPI hosts permitted to proxy through the editor.  The default permits
+# our own UI (which lives on the same hostname).  Override WOPI_HOST_REGEX
+# in the OpenHost dashboard to additionally allow remote hosts.
 ZONE_DOMAIN_REGEX_ESCAPED="$(printf '%s' "${ZONE_DOMAIN}" | sed 's/\./\\./g')"
 WOPI_HOST_REGEX="${WOPI_HOST_REGEX:-https://[^/]+\\.${ZONE_DOMAIN_REGEX_ESCAPED}}"
 
-# coolwsd reads ``extra_params`` and appends it after its own argv.  The
-# upstream script comments document this contract.
-extra_params="
+# coolwsd extra params:
+#   server_name     — what coolwsd publishes in /hosting/discovery URLs.
+#                     Has to match what the user's browser sees, since
+#                     that's the URL the editor iframe connects back to.
+#   ssl.enable      — false; we do plain HTTP between Quart and coolwsd
+#                     (loopback) and between OpenHost router and Quart.
+#   ssl.termination — true; coolwsd builds outbound URLs as https,
+#                     reflecting what the public-facing TLS terminator
+#                     will serve.
+#   net.listen      — loopback so coolwsd can't be reached except through
+#                     Quart's proxy.  Defence in depth — the OpenHost
+#                     router only publishes 8080 anyway.
+#   security.{cap,seccomp}=false — rootless OpenHost can't grant
+#                     CAP_SYS_ADMIN or load custom seccomp profiles.
+export extra_params="
 --o:server_name=${SERVER_NAME}
 --o:ssl.enable=false
 --o:ssl.termination=true
 --o:net.proto=IPv4
---o:net.listen=any
+--o:net.listen=loopback
 --o:storage.wopi.alias_groups[@mode]=groups
 --o:storage.wopi.alias_groups.group[1].host[@allow]=true
 --o:storage.wopi.alias_groups.group[1].host=${WOPI_HOST_REGEX}
@@ -55,6 +60,48 @@ extra_params="
 --o:logging.level=warning
 "
 
-export extra_params
+# ----------------------------------------------------------------------
+# Start child 1: coolwsd via the upstream launcher.
+# ----------------------------------------------------------------------
 
-exec /start-collabora-online.sh
+/start-collabora-online.sh &
+COOLWSD_PID=$!
+echo "[entrypoint] coolwsd pid=${COOLWSD_PID}"
+
+# ----------------------------------------------------------------------
+# Start child 2: Quart UI + proxy.
+# ----------------------------------------------------------------------
+
+cd /opt/openhost-app
+exec_hypercorn() {
+    # `exec` so SIGTERM hits hypercorn directly, not the bash wrapper.
+    exec /opt/openhost-venv/bin/hypercorn \
+        --bind 0.0.0.0:8080 \
+        --access-logfile - \
+        --error-logfile - \
+        --workers 1 \
+        server:app
+}
+
+exec_hypercorn &
+QUART_PID=$!
+echo "[entrypoint] quart pid=${QUART_PID}"
+
+# ----------------------------------------------------------------------
+# Forward SIGTERM and wait for either child to exit.
+# ----------------------------------------------------------------------
+
+shutdown() {
+    echo "[entrypoint] SIGTERM received, stopping children"
+    kill -TERM "${COOLWSD_PID}" "${QUART_PID}" 2>/dev/null || true
+    wait "${COOLWSD_PID}" "${QUART_PID}" 2>/dev/null || true
+    exit 0
+}
+trap shutdown TERM INT
+
+# `wait -n` returns when the first child exits.  Whichever it is, we
+# tear down the other and exit; OpenHost reschedules.
+wait -n "${COOLWSD_PID}" "${QUART_PID}"
+EXIT_CODE=$?
+echo "[entrypoint] a child exited (code ${EXIT_CODE}); shutting down"
+shutdown

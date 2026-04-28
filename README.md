@@ -1,105 +1,130 @@
 # openhost-collabora
 
 [Collabora Online (CODE)](https://www.collaboraonline.com/) packaged for
-OpenHost.  Serves the in-browser office editor (Writer / Calc / Impress) over
-the WOPI protocol.
+OpenHost, with a built-in barebones file manager.  Open the app, upload or
+create documents, click to edit them in the browser.  Your changes save
+back to the same list.
 
-## What this is — and what it isn't
+## What's inside
 
-Collabora Online is a **backend** for an editor iframe.  It does not manage
-files itself; documents live on a separate **WOPI host** (Nextcloud, ownCloud,
-EtherCalc, a custom WOPI server, ...).  The WOPI host calls Collabora's
-`/hosting/discovery` endpoint to learn which file extensions are editable, then
-embeds the editor in a `<iframe src=".../cool/<doc-url>?WOPISrc=...">`.
+A single container running two processes:
 
-So this app on its own is not a usable office suite.  Open
-`https://collabora.{your-zone}/` directly and you get either a "OK" page or
-the admin console.  To actually edit a document you need to point a WOPI host
-at this URL.
+- **coolwsd** — Collabora's editor backend, on `127.0.0.1:9980` (loopback only).
+- **Quart** — a small Python web app on `0.0.0.0:8080` that serves:
+  - `/`                            — the file list
+  - `/upload`, `/new/<kind>`, `/delete/<id>`, `/download/<id>`, `/open/<id>` — file-management routes
+  - `/wopi/files/<id>`, `/wopi/files/<id>/contents` — the WOPI host endpoints coolwsd talks to during edits
+  - `/browser/`, `/cool/`, `/lool/`, `/hosting/`, `/favicon.ico`, `/robots.txt` — reverse-proxied to coolwsd (HTTP and WebSocket)
 
-The minimal happy path:
+Everything reaches the user through the single `8080` port that OpenHost
+publishes.  `coolwsd` is loopback-only; the only way to reach the editor
+from outside the container is through the Quart proxy.
 
-1. Deploy `collabora` (this app) to your OpenHost zone.
-2. Deploy a WOPI-capable file server (e.g. Nextcloud + the
-   "Nextcloud Office" / "Collabora Online" app) in the same zone.
-3. In the WOPI host's settings, set the Collabora server URL to
-   `https://collabora.{your-zone}` and enable SSL termination.
-4. Open a `.docx` from the WOPI host's UI; it should load the Collabora
-   editor in an iframe.
+## What works
 
-## Smoke test
+- List, upload, download, delete documents.
+- "+ New document / spreadsheet / presentation" creates a blank `.odt` /
+  `.ods` / `.odp` and drops you straight into the editor.
+- Click an editable file → opens the Collabora editor in an iframe.  Save
+  in the editor → file in the list updates (size + mtime change).
 
-Without a WOPI host you can still confirm the backend is up:
+## What deliberately doesn't work (yet)
 
-```sh
-curl -s https://collabora.{your-zone}/hosting/discovery | head -20
-curl -s https://collabora.{your-zone}/hosting/capabilities
-```
+- No folders, multi-select, sort, search, rename.
+- No multi-user / sharing / per-document permissions.  Whoever has the
+  OpenHost zone-owner cookie sees and edits everything.
+- No version history.  PutFile overwrites the document atomically; old
+  bytes are gone.
+- No file type other than the ones Collabora can edit (Writer / Calc /
+  Impress family).  You can upload anything via `/upload` and download
+  it via `/download/<id>`, but only office-document extensions show an
+  "Open" link.
 
-`/hosting/discovery` returns an XML doc listing supported MIME types.
-`/hosting/capabilities` returns a small JSON capability descriptor.  Both
-require nothing more than the backend being healthy.
+## Persistent state
 
-## WOPI host allowlist
-
-Collabora rejects document-load requests from unknown WOPI hosts.  By default
-this image accepts any `https://*.{zone-domain}` host so a sibling app in the
-same OpenHost zone works automatically.  Override with the `WOPI_HOST_REGEX`
-env var (set in the OpenHost dashboard) for remote WOPI hosts:
+Lives under `OPENHOST_APP_DATA_DIR`:
 
 ```
-WOPI_HOST_REGEX=https://(my-nextcloud\\.example\\.com|other-host\\.example\\.org)
+files/<uuid>     — raw document bytes, one per file
+index.db         — sqlite metadata (filename, size, ext, mtime)
 ```
 
-## Security caveats — read this
+The blank-document templates baked into the image (under
+`/opt/collabora-blank-templates/`) are read-only and not user data; they
+get copied into `files/` as new documents are created.
 
-The standard Collabora deployment uses a `CAP_SYS_ADMIN` mount jail plus a
-custom seccomp profile to isolate document-rendering child processes.
-**Rootless OpenHost provides neither**, so this image disables those features:
+## Security caveats — please read
 
-- `--o:security.capabilities=false`
-- `--o:security.seccomp=false`
+Two things to know:
 
-Process isolation falls back to the OpenHost user namespace plus
-`no_new_privileges=true`.  This is **weaker** than upstream's default: a
-LibreOffice document-rendering bug that escapes the per-document forkit could
-read other documents the same container has loaded.  Do not pair this app
-with a WOPI host that serves untrusted documents to mutually-distrusting users.
+1. **Process isolation is weaker than upstream.**  The standard Collabora
+   deployment uses a `CAP_SYS_ADMIN` mount jail plus a custom seccomp
+   profile to isolate document-rendering child processes.  Rootless
+   OpenHost provides neither, so this image disables both:
+   `--o:security.capabilities=false`, `--o:security.seccomp=false`.
+   Process isolation falls back to the OpenHost user namespace plus
+   `no_new_privileges=true`.  This is **weaker** than upstream's default:
+   a LibreOffice document-rendering bug that escapes the per-document
+   forkit could read other documents the same container has loaded.  Do
+   not pair this app with documents from mutually-distrusting authors.
+   For a single-user / single-tenant zone (you and your own files), this
+   is the same threat model as running LibreOffice locally.
 
-For the single-user / single-tenant zone case (you and your own files), this
-is the same threat model as running LibreOffice locally.
-
-## Configuration
-
-| Env var            | Default                                                | Purpose                                                              |
-|--------------------|--------------------------------------------------------|----------------------------------------------------------------------|
-| `WOPI_HOST_REGEX`  | `https://[^/]+\.{zone-domain}`                         | Regex matched against WOPI host URLs presented in `WOPISrc=` query.  |
-
-`OPENHOST_APP_NAME` and `OPENHOST_ZONE_DOMAIN` are read automatically to
-build the `server_name` Collabora publishes in its discovery payload.
+2. **Authentication is the OpenHost zone-owner cookie.**  All UI routes
+   are gated by OpenHost's regular login.  The WOPI endpoints
+   (`/wopi/files/<id>`, `/wopi/files/<id>/contents`) are gated by an
+   in-process random `access_token` instead — they have to be reachable
+   without an OpenHost cookie because coolwsd inside the same container
+   calls them with no session of its own.  That token is generated fresh
+   on every container start.  It's not a security boundary against an
+   attacker who can already MITM the loopback interface, but it does
+   reject accidental WOPI calls from unrelated apps on the same host.
 
 ## Resources
 
-The defaults (1 GB RAM, 1 CPU) are enough for a few concurrent documents.
-Bump `[resources].memory_mb` if you expect heavy concurrent editing or
-large `.xlsx` workbooks; LibreOffice's per-document RAM appetite is real.
+The defaults are 2 GB RAM / 2 CPUs.  LibreOffice's per-document RAM
+appetite is real; bump higher under heavy concurrent editing or large
+spreadsheets.
 
-## Limitations
+## Limitations inherited from OpenHost
 
-- `[resources].gpu = true` is not honoured by OpenHost (router code stores it
-  but never adds the device flag), so any GPU acceleration the upstream image
-  expects is unavailable.
-- `--shm-size` cannot be configured via the OpenHost manifest; the container
-  runs with the rootless-podman default (64 MiB).  This is enough for typical
-  document workloads but may be tight under heavy spreadsheet recalc.
-- The WOPI proof key is regenerated on every container restart (upstream
-  default).  WOPI hosts that cache the proof key will need to re-fetch it
-  after every redeploy — most do this transparently from
-  `/hosting/discovery`.
+- `[resources].gpu = true` is not honoured by the OpenHost router (it
+  stores the field but never adds the device flag).
+- `--shm-size` cannot be configured via the OpenHost manifest; the
+  container uses the rootless-podman default (64 MiB).  Sufficient for
+  typical document workloads.
+- Logs are not rotated by OpenHost; the container's stdout/stderr append
+  unbounded to `docker.log` until the next reload.
+
+## Configuration
+
+| Env var            | Default                         | Purpose                                                   |
+|--------------------|---------------------------------|-----------------------------------------------------------|
+| `WOPI_HOST_REGEX`  | `https://[^/]+\.{zone-domain}`  | Hosts coolwsd will accept WOPI document-load calls from.  |
+
+`OPENHOST_APP_NAME` and `OPENHOST_ZONE_DOMAIN` are read automatically.
+
+## Layout
+
+```
+.
+├── Dockerfile                         # collabora/code base + python venv + UI
+├── openhost.toml                      # OpenHost manifest (port 8080)
+├── openhost-entrypoint.sh             # supervises coolwsd + hypercorn
+├── scripts/
+│   └── generate-blank-templates.sh    # build-time: creates blank.{odt,ods,odp}
+└── app/
+    ├── server.py                      # Quart UI + WOPI host + reverse proxy
+    └── templates/
+        ├── index.html                 # file list
+        └── editor.html                # iframe shell that POSTs to coolwsd
+```
 
 ## Upstream
 
-- Image: <https://hub.docker.com/r/collabora/code>
+- Collabora image: <https://hub.docker.com/r/collabora/code>
 - Source: <https://github.com/CollaboraOnline/online>
-- Configuration reference:
+- WOPI protocol:
+  <https://learn.microsoft.com/en-us/microsoft-365/cloud-storage-partner-program/online/wopi-rest-apis>
+- Collabora SDK:
   <https://sdk.collaboraonline.com/docs/installation/Configuration.html>

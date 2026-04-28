@@ -1,11 +1,11 @@
 [app]
 name = "collabora"
-version = "0.1.0"
-description = "Collabora Online (CODE) backend — serves the in-browser office editor over WOPI; pair with a WOPI host like Nextcloud."
+version = "0.2.0"
+description = "Collabora Online (CODE) office suite with a built-in file manager — upload, edit, and save documents in your browser."
 
 [runtime.container]
 image = "Dockerfile"
-port = 9980
+port = 8080
 
 [resources]
 # LibreOffice document processes are RAM-hungry.  2 GB is enough for a few
@@ -13,21 +13,6 @@ port = 9980
 memory_mb = 2048
 cpu_millicores = 2000
 
-[routing]
-# Collabora's WOPI surface is public by design: the WOPI host (Nextcloud,
-# etc.) hits /hosting/discovery to learn what extensions are editable, the
-# browser loads /browser/<ver>/cool.html as the iframe entry point, and
-# documents proxy through /cool/<doc-url>/ws (WebSocket) and /cool/<doc-url>/.
-# All of these have to be reachable without an OpenHost login cookie because
-# end-users come in via the WOPI host's own auth, not OpenHost's.  Document
-# permissions are checked WOPI-side, not OpenHost-side.
-public_paths = [
-  "/hosting/discovery",
-  "/hosting/capabilities",
-  "/browser/",
-  "/cool/",
-  "/lool/",
-  "/favicon.ico",
-  "/robots.txt",
-]
-health_check = "/hosting/capabilities"
+[data]
+# Documents the user uploads/creates live here, plus a tiny sqlite index.
+app_data = true

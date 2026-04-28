@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Collabora — files</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 980px;
+      margin: 32px auto;
+      padding: 0 16px;
+      line-height: 1.4;
+    }
+    h1 { margin-bottom: 8px; }
+    .subtle { color: #888; font-size: 0.9em; margin-bottom: 24px; }
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin: 16px 0 28px 0;
+      padding: 16px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      background: #fafafa;
+    }
+    .actions form { margin: 0; }
+    .actions button, .actions label.upload {
+      padding: 8px 14px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fff;
+      cursor: pointer;
+      font: inherit;
+    }
+    .actions label.upload input { display: none; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid #eee;
+      vertical-align: middle;
+    }
+    th { font-weight: 600; font-size: 0.85em; text-transform: uppercase; color: #666; }
+    tr.row-empty td { color: #888; padding: 32px 8px; text-align: center; }
+    a.filename { font-weight: 500; text-decoration: none; color: inherit; }
+    a.filename:hover { text-decoration: underline; }
+    .ext-tag {
+      display: inline-block;
+      padding: 2px 6px;
+      font-size: 0.75em;
+      border-radius: 4px;
+      background: #eef;
+      color: #336;
+      margin-left: 8px;
+      text-transform: uppercase;
+    }
+    .row-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .row-actions a, .row-actions button {
+      padding: 4px 10px;
+      font-size: 0.85em;
+      border: 1px solid #ccc;
+      background: #fff;
+      border-radius: 4px;
+      cursor: pointer;
+      text-decoration: none;
+      color: inherit;
+    }
+    .row-actions button.danger { color: #a33; border-color: #d99; }
+    @media (prefers-color-scheme: dark) {
+      .actions { background: #222; border-color: #333; }
+      .actions button, .actions label.upload { background: #2a2a2a; border-color: #444; color: inherit; }
+      th, td { border-color: #333; }
+      th { color: #aaa; }
+      .ext-tag { background: #223; color: #aac; }
+      .row-actions a, .row-actions button { background: #2a2a2a; border-color: #444; color: inherit; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Collabora</h1>
+  <p class="subtle">Documents you create or upload here open in the editor.  Saving in the editor writes back to this list.</p>
+
+  <div class="actions">
+    {% for kind in new_doc_kinds %}
+    <form method="POST" action="/new/{{ kind }}">
+      <button type="submit">+ New {{ {"writer": "document", "calc": "spreadsheet", "impress": "presentation"}[kind] }}</button>
+    </form>
+    {% endfor %}
+    <form method="POST" action="/upload" enctype="multipart/form-data" id="upload-form">
+      <label class="upload">
+        Upload…
+        <input type="file" name="file" onchange="document.getElementById('upload-form').submit()" />
+      </label>
+    </form>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Size</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if not files %}
+      <tr class="row-empty"><td colspan="3">No documents yet.  Create or upload one to start.</td></tr>
+      {% endif %}
+      {% for f in files %}
+      <tr>
+        <td>
+          {% if f.editable %}
+          <a class="filename" href="/open/{{ f.id }}">{{ f.name }}</a>
+          {% else %}
+          <span class="filename">{{ f.name }}</span>
+          {% endif %}
+          <span class="ext-tag">{{ f.ext }}</span>
+        </td>
+        <td>{{ f.size_human }}</td>
+        <td>
+          <div class="row-actions">
+            {% if f.editable %}
+            <a href="/open/{{ f.id }}">Open</a>
+            {% endif %}
+            <a href="/download/{{ f.id }}">Download</a>
+            <form method="POST" action="/delete/{{ f.id }}" onsubmit="return confirm('Delete {{ f.name|e }}?')" style="display:inline">
+              <button type="submit" class="danger">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
