@@ -1,48 +1,99 @@
 #!/bin/bash
-# Run inside the Collabora image at build time.  Uses the bundled
-# Collabora Office (libreoffice headless) to produce three minimal seed
-# documents that the UI's "+ New" buttons copy into the user's app_data.
-#
-# We generate at build time rather than runtime because:
-#   - The seeds are deterministic (no per-instance customization needed).
-#   - Doing it at runtime would require LO to be running when the user
-#     hits "New", adding 2-3 seconds of latency per click.
-#   - Shipping a couple of ~3 KB fixtures in the image is cheap.
+# Run inside the Collabora image at build time.  Produces three minimal
+# OpenDocument seed files that the UI's "+ New" buttons copy into the
+# user's app_data when creating a fresh document.
 #
 # Output: /opt/collabora-blank-templates/blank.{odt,ods,odp}
 #
-# We feed LO an empty input from /dev/null and ask it to convert to the
-# three target formats.  Each command exits non-zero loud so Dockerfile
-# build fails fast if the bundled LO binary path moved.
+# We initially tried ``soffice --convert-to`` but text→ods/odp filters
+# don't exist in headless LibreOffice; ``soffice macro://`` invocations
+# of ``loadComponentFromURL`` are flaky across LO builds.  The simplest
+# hermetic approach is to write the OpenDocument zips by hand: each is a
+# zipfile containing mimetype, manifest.xml, content.xml, styles.xml,
+# meta.xml.  An empty Writer/Calc/Impress document fits in ~1 KB; LO
+# accepts these as legitimate documents and Collabora opens them in the
+# corresponding editor mode.
 
 set -euo pipefail
 
 OUT=/opt/collabora-blank-templates
 mkdir -p "$OUT"
 
-# Seed an empty plaintext file; LO converts it cleanly to odt/ods/odp.
-SEED=/tmp/blank-seed.txt
-: > "$SEED"
+python3 - <<'PYEOF'
+import os
+import zipfile
 
-# coolwsd's LibreOffice install lives under /opt/collaboraoffice;
-# /usr/bin/libreoffice is a thin wrapper that may not exist in the
-# Collabora CODE image.  Resolve by globbing.
-SOFFICE=$(find /opt/collaboraoffice* -name soffice -type f -executable 2>/dev/null | head -1 || true)
-if [[ -z "${SOFFICE}" ]]; then
-  echo "no soffice binary found under /opt/collaboraoffice*" >&2
-  exit 1
-fi
+OUT = "/opt/collabora-blank-templates"
+os.makedirs(OUT, exist_ok=True)
 
-cd "$OUT"
-export HOME=/tmp
-"$SOFFICE" --headless --convert-to odt "$SEED" --outdir "$OUT"
-"$SOFFICE" --headless --convert-to ods "$SEED" --outdir "$OUT"
-"$SOFFICE" --headless --convert-to odp "$SEED" --outdir "$OUT"
+MANIFEST = '''<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+  <manifest:file-entry manifest:full-path="/" manifest:version="1.2" manifest:media-type="{mime}"/>
+  <manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+  <manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>
+  <manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>
+'''
 
-# soffice names outputs after the input (blank-seed.odt, etc).  Rename to
-# the names the Quart app expects so we don't have to special-case in code.
-mv "$OUT/blank-seed.odt" "$OUT/blank.odt"
-mv "$OUT/blank-seed.ods" "$OUT/blank.ods"
-mv "$OUT/blank-seed.odp" "$OUT/blank.odp"
+STYLES = '''<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" office:version="1.2"/>
+'''
+
+META = '''<?xml version="1.0" encoding="UTF-8"?>
+<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+                       xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0"
+                       office:version="1.2">
+  <office:meta>
+    <meta:generator>openhost-collabora blank-template</meta:generator>
+  </office:meta>
+</office:document-meta>
+'''
+
+CONTENT_TEMPLATES = {
+    "odt": (
+        "application/vnd.oasis.opendocument.text",
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"'
+        ' xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2">'
+        "<office:body><office:text><text:p/></office:text></office:body>"
+        "</office:document-content>",
+    ),
+    "ods": (
+        "application/vnd.oasis.opendocument.spreadsheet",
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"'
+        ' xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" office:version="1.2">'
+        "<office:body><office:spreadsheet>"
+        '<table:table table:name="Sheet1"><table:table-row><table:table-cell/></table:table-row></table:table>'
+        "</office:spreadsheet></office:body>"
+        "</office:document-content>",
+    ),
+    "odp": (
+        "application/vnd.oasis.opendocument.presentation",
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"'
+        ' xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" office:version="1.2">'
+        "<office:body><office:presentation>"
+        '<draw:page draw:name="Slide1"/>'
+        "</office:presentation></office:body>"
+        "</office:document-content>",
+    ),
+}
+
+for ext, (mime, content_xml) in CONTENT_TEMPLATES.items():
+    path = os.path.join(OUT, f"blank.{ext}")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        # OpenDocument requires the "mimetype" entry to be first AND
+        # stored uncompressed, so the magic-byte detector at the file
+        # head can identify the document family.
+        info = zipfile.ZipInfo("mimetype")
+        info.compress_type = zipfile.ZIP_STORED
+        zf.writestr(info, mime)
+        zf.writestr("META-INF/manifest.xml", MANIFEST.format(mime=mime))
+        zf.writestr("content.xml", content_xml)
+        zf.writestr("styles.xml", STYLES)
+        zf.writestr("meta.xml", META)
+    print(f"wrote {path} ({os.path.getsize(path)} bytes)")
+PYEOF
 
 ls -la "$OUT"
