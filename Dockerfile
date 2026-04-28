@@ -20,7 +20,7 @@
 #     OpenHost's ``no_new_privileges=true``.  Process isolation is weaker
 #     than the upstream default; do not pair this with untrusted documents.
 
-FROM collabora/code:25.04.1.1
+FROM collabora/code:25.04.9.4.1
 
 # ``cool`` (uid 1001) is the runtime user baked into the upstream image.  Run
 # the wrapper as that user so the existing /etc/coolwsd / /opt/cool ownership
