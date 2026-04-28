@@ -7,6 +7,12 @@ description = "Collabora Online (CODE) backend — serves the in-browser office 
 image = "Dockerfile"
 port = 9980
 
+[resources]
+# LibreOffice document processes are RAM-hungry.  2 GB is enough for a few
+# concurrent documents; bump higher for heavy use.
+memory_mb = 2048
+cpu_millicores = 2000
+
 [routing]
 # Collabora's WOPI surface is public by design: the WOPI host (Nextcloud,
 # etc.) hits /hosting/discovery to learn what extensions are editable, the
