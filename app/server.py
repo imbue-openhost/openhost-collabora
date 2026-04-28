@@ -352,9 +352,18 @@ async def editor_page(file_id: str):
     #      so coolwsd loads the doc.  GET-with-token is also supported but
     #      POST is recommended by Collabora's docs (keeps the token out of
     #      logs).
+    #
+    # WOPISrc points at loopback rather than the public URL.  The
+    # iframe's <form action> is loaded by the browser via the public URL,
+    # which is fine — the browser only ever sees the public origin.
+    # WOPISrc, by contrast, is dereferenced by coolwsd from *inside* the
+    # container; using loopback avoids a hairpin trip out through the
+    # OpenHost router and back to ourselves, plus it sidesteps any
+    # outbound DNS/firewall surprises.
+    wopi_src = f"http://127.0.0.1:8080/wopi/files/{file_id}"
     cool_url = (
         f"{PUBLIC_BASE}/browser/dist/cool.html"
-        f"?WOPISrc={PUBLIC_BASE}/wopi/files/{file_id}"
+        f"?WOPISrc={wopi_src}"
         f"&closebutton=true"
     )
     return await render_template(
