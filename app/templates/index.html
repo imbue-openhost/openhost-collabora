@@ -19,20 +19,35 @@
       display: flex;
       gap: 12px;
       flex-wrap: wrap;
+      align-items: center;
       margin: 16px 0 28px 0;
       padding: 16px;
       border: 1px solid #ddd;
       border-radius: 8px;
       background: #fafafa;
     }
-    .actions form { margin: 0; }
+    .actions form { margin: 0; display: inline-flex; }
+    /* Visually unify the new-doc <button>s and the upload <label> by
+       targeting both with the same declarations.  <label> and <button>
+       have different default user-agent box-sizing, line-height, and
+       text rendering — listing them under one selector and forcing the
+       same box model keeps the upload control from sitting half a pixel
+       taller (or half a pixel narrower) than its neighbours. */
     .actions button, .actions label.upload {
-      padding: 8px 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
+      height: 36px;
+      padding: 0 14px;
       border: 1px solid #ccc;
       border-radius: 6px;
       background: #fff;
       cursor: pointer;
       font: inherit;
+      line-height: 1;
+      white-space: nowrap;
+      vertical-align: middle;
     }
     .actions label.upload input { display: none; }
     table {
