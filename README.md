@@ -1,9 +1,11 @@
 # openhost-collabora
 
-[Collabora Online (CODE)](https://www.collaboraonline.com/) packaged for
-OpenHost, with a built-in barebones file manager.  Open the app, upload or
-create documents, click to edit them in the browser.  Your changes save
-back to the same list.
+Online office suite (Writer / Calc / Impress) for your OpenHost zone.
+Upload or create documents, click to edit them in the browser, save back
+to the same list.  No external file server needed — the file manager and
+the Collabora editor backend ship together in one container.
+
+Built on [Collabora Online (CODE)](https://www.collaboraonline.com/).
 
 ## What's inside
 

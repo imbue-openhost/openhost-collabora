@@ -1,7 +1,7 @@
 [app]
 name = "collabora"
 version = "0.2.0"
-description = "Collabora Online (CODE) office suite with a built-in file manager — upload, edit, and save documents in your browser."
+description = "Online office suite (Writer, Calc, Impress) with a built-in file manager — upload, edit, and save documents from your browser. Powered by Collabora Online."
 
 [runtime.container]
 image = "Dockerfile"
