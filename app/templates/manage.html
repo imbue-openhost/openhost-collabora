@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Share — {{ file.name }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      max-width: 980px;
+      margin: 32px auto;
+      padding: 0 16px;
+      line-height: 1.4;
+    }
+    h1 { margin-bottom: 4px; }
+    .file-meta { color: #888; font-size: 0.9em; margin-bottom: 28px; }
+    a.back { text-decoration: none; color: inherit; font-size: 0.85em; }
+    a.back:hover { text-decoration: underline; }
+    .new-share {
+      padding: 16px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      background: #fafafa;
+      margin-bottom: 28px;
+    }
+    .new-share fieldset { border: none; padding: 0; margin: 0 0 12px 0; }
+    .new-share legend { font-weight: 600; font-size: 0.9em; margin-bottom: 8px; }
+    .new-share label { margin-right: 16px; cursor: pointer; }
+    .new-share .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .new-share select, .new-share button {
+      padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px;
+      background: #fff; font: inherit;
+    }
+    .new-share button { cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      text-align: left; padding: 10px 8px;
+      border-bottom: 1px solid #eee; vertical-align: middle;
+    }
+    th { font-weight: 600; font-size: 0.85em; text-transform: uppercase; color: #666; }
+    tr.row-empty td { color: #888; padding: 32px 8px; text-align: center; }
+    tr.inactive td { opacity: 0.55; }
+    .badge {
+      display: inline-block; padding: 2px 8px; font-size: 0.75em;
+      border-radius: 999px; background: #eef; color: #336;
+      text-transform: uppercase;
+    }
+    .badge.view     { background: #efe; color: #363; }
+    .badge.edit     { background: #fef0d6; color: #835400; }
+    .badge.download { background: #eef; color: #336; }
+    .badge.dead     { background: #fee; color: #a33; }
+    .url-box {
+      display: flex; gap: 6px; align-items: center; max-width: 500px;
+    }
+    .url-box input {
+      flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8em; padding: 4px 8px; border: 1px solid #ddd;
+      border-radius: 4px; background: #f5f5f5;
+    }
+    .url-box button {
+      padding: 4px 10px; font-size: 0.85em; border: 1px solid #ccc;
+      background: #fff; border-radius: 4px; cursor: pointer;
+    }
+    .row-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .row-actions button {
+      padding: 4px 10px; font-size: 0.85em; border: 1px solid #ccc;
+      background: #fff; border-radius: 4px; cursor: pointer;
+      font-family: inherit;
+    }
+    .row-actions button.danger { color: #a33; border-color: #d99; }
+    @media (prefers-color-scheme: dark) {
+      .new-share { background: #222; border-color: #333; }
+      .new-share select, .new-share button { background: #2a2a2a; border-color: #444; color: inherit; }
+      th, td { border-color: #333; }
+      th { color: #aaa; }
+      .url-box input { background: #1a1a1a; border-color: #333; color: inherit; }
+      .url-box button, .row-actions button { background: #2a2a2a; border-color: #444; color: inherit; }
+      .badge.view { background: #1f2d1f; color: #9c9; }
+      .badge.edit { background: #2d2618; color: #c9a; }
+      .badge.download { background: #1d2030; color: #aac; }
+      .badge.dead { background: #2d1818; color: #c66; }
+    }
+  </style>
+</head>
+<body>
+  <p><a class="back" href="/">← back to files</a></p>
+  <h1>Share — {{ file.name }}</h1>
+  <p class="file-meta">Anyone with a share link can use it without an OpenHost login.</p>
+
+  <div class="new-share">
+    <form method="POST" action="/manage/{{ file.id }}/create">
+      <fieldset>
+        <legend>Create a link</legend>
+        <div class="row">
+          <label><input type="radio" name="mode" value="view" checked /> View only</label>
+          <label><input type="radio" name="mode" value="edit" /> View &amp; edit</label>
+          <label><input type="radio" name="mode" value="download" /> Download only</label>
+        </div>
+      </fieldset>
+      <div class="row">
+        <label for="ttl">Expires</label>
+        <select id="ttl" name="ttl_seconds">
+          <option value="86400">in 1 day</option>
+          <option value="604800">in 7 days</option>
+          <option value="2592000" selected>in 30 days</option>
+          <option value="7776000">in 90 days</option>
+          <option value="31536000">in 1 year</option>
+          <option value="">never</option>
+        </select>
+        <button type="submit">Create link</button>
+      </div>
+    </form>
+  </div>
+
+  <h2 style="font-size: 1.1em; margin-bottom: 12px;">Existing links</h2>
+  <table>
+    <thead>
+      <tr><th>Mode</th><th>Link</th><th>Expires</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% if not shares %}
+      <tr class="row-empty"><td colspan="4">No share links yet.</td></tr>
+      {% endif %}
+      {% for s in shares %}
+      <tr class="{% if not s.active %}inactive{% endif %}">
+        <td>
+          <span class="badge {{ s.mode }}">{{ s.mode }}</span>
+          {% if s.revoked %}
+          <span class="badge dead">revoked</span>
+          {% elif s.expired %}
+          <span class="badge dead">expired</span>
+          {% endif %}
+        </td>
+        <td>
+          <div class="url-box">
+            <input type="text" readonly value="{{ s.share_url }}" onclick="this.select()" id="url-{{ s.token }}" />
+            <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('url-{{ s.token }}').value); this.textContent='✓';">Copy</button>
+          </div>
+        </td>
+        <td>{{ s.expires_human }}</td>
+        <td>
+          <div class="row-actions">
+            {% if s.active %}
+            <form method="POST" action="/manage/{{ file.id }}/extend" style="display:inline">
+              <input type="hidden" name="token" value="{{ s.token }}" />
+              <input type="hidden" name="ttl_seconds" value="2592000" />
+              <button type="submit" title="Extend by 30 days from now">Extend 30d</button>
+            </form>
+            <form method="POST" action="/manage/{{ file.id }}/revoke" style="display:inline" onsubmit="return confirm('Revoke this link? Anyone using it will lose access immediately.')">
+              <input type="hidden" name="token" value="{{ s.token }}" />
+              <button type="submit" class="danger">Revoke</button>
+            </form>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>

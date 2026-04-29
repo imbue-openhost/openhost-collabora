@@ -29,6 +29,7 @@ search.  This is "barebones": list, upload, open, save, delete, new-doc.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import mimetypes
 import os
 import re
@@ -114,6 +115,11 @@ TEMPLATE_SEEDS = {
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # Sqlite ships with foreign-key enforcement OFF by default — the FK in
+    # the shares table is just documentary unless we flip this on per
+    # connection.  We rely on it for cascading delete (deleting a file row
+    # auto-removes its share rows).
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -131,6 +137,32 @@ def init_db() -> None:
                 mtime REAL NOT NULL
             )
             """
+        )
+        # Per-document share tokens.  Each row is one shareable link.
+        # ``mode`` controls what the recipient can do:
+        #   view     — open in the editor read-only
+        #   edit     — open in the editor with write access
+        #   download — fetch the raw bytes, no editor involved
+        # ``expires_at`` is a unix timestamp; NULL means "never expires"
+        # but the UI defaults to 30 days from creation.  ``revoked`` is a
+        # tombstone — we keep the row so revoked tokens can be listed
+        # historically (and so a future "see who's currently editing"
+        # feature has stable UserIds to attribute to).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shares (
+                token TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (mode IN ('view', 'edit', 'download')),
+                created_at REAL NOT NULL,
+                expires_at REAL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shares_file_id ON shares (file_id)"
         )
 
 
@@ -169,7 +201,105 @@ def update_file_size(file_id: str, size: int, mtime: float) -> None:
 
 def delete_file_row(file_id: str) -> None:
     with _connect() as conn:
+        # Cascading delete (foreign_keys=ON) drops the share rows too.
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+
+
+# ---------------------------------------------------------------------------
+# Sqlite — share tokens
+# ---------------------------------------------------------------------------
+
+# Default lifetime of a freshly-minted share link.  Operators can extend
+# individual links from the manage-shares UI.  30 days is a middle ground
+# between "share with one person, never revoke" and "set in stone forever".
+DEFAULT_SHARE_TTL_SECONDS = 30 * 24 * 3600
+
+# Mode → directory letter used in the public URL prefix.  Keeping the URL
+# short matters when these get pasted into chat / email.
+MODE_TO_LETTER = {"view": "v", "edit": "e", "download": "d"}
+LETTER_TO_MODE = {v: k for k, v in MODE_TO_LETTER.items()}
+
+
+def create_share(file_id: str, mode: str, ttl_seconds: int | None) -> str:
+    """Mint a new share token.  ttl_seconds=None means "never expire"."""
+    if mode not in MODE_TO_LETTER:
+        raise ValueError(f"invalid share mode: {mode}")
+    token = secrets.token_urlsafe(24)
+    now = time.time()
+    expires = now + ttl_seconds if ttl_seconds else None
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO shares (token, file_id, mode, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (token, file_id, mode, now, expires),
+        )
+    return token
+
+
+def get_share(token: str) -> dict[str, Any] | None:
+    """Return the share row if the token is well-formed, exists, has not
+    been revoked, and has not expired.  Otherwise return None.
+
+    All four checks live here so callers can't accidentally trust a
+    revoked-but-not-expired or expired-but-not-revoked row.
+    """
+    # Token shape check before hitting the DB — secrets.token_urlsafe(24)
+    # produces 32 chars from the [A-Za-z0-9_-] alphabet.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32}", token):
+        return None
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT token, file_id, mode, created_at, expires_at, revoked "
+            "FROM shares WHERE token = ?",
+            (token,),
+        ).fetchone()
+    if row is None:
+        return None
+    row = dict(row)
+    if row["revoked"]:
+        return None
+    if row["expires_at"] is not None and row["expires_at"] < time.time():
+        return None
+    return row
+
+
+def list_shares_for_file(file_id: str) -> list[dict[str, Any]]:
+    """List all shares (active and inactive) for a file, newest first.
+
+    Inactive ones are still surfaced in the manage-shares UI so the owner
+    can see "I revoked this last Tuesday" rather than have it silently
+    disappear.
+    """
+    now = time.time()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT token, file_id, mode, created_at, expires_at, revoked "
+            "FROM shares WHERE file_id = ? ORDER BY created_at DESC",
+            (file_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["expired"] = d["expires_at"] is not None and d["expires_at"] < now
+        d["active"] = not d["revoked"] and not d["expired"]
+        out.append(d)
+    return out
+
+
+def revoke_share(token: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE shares SET revoked = 1 WHERE token = ?", (token,))
+
+
+def extend_share(token: str, ttl_seconds: int | None) -> None:
+    """Push the expiry forward by ``ttl_seconds`` from now, or remove the
+    expiry entirely if ttl_seconds is None.
+    """
+    new_expiry = (time.time() + ttl_seconds) if ttl_seconds else None
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE shares SET expires_at = ?, revoked = 0 WHERE token = ?",
+            (new_expiry, token),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +501,7 @@ async def editor_page(file_id: str):
         file=row,
         cool_url=cool_url,
         access_token=WOPI_ACCESS_TOKEN,
+        permission="edit",
     )
 
 
@@ -392,28 +523,72 @@ async def editor_page(file_id: str):
 # ---------------------------------------------------------------------------
 
 
-def _check_wopi_token() -> None:
+def _resolve_wopi_caller(file_id: str) -> dict[str, Any]:
+    """Validate the WOPI access_token query param and return the caller's
+    effective permissions and identity for ``file_id``.
+
+    The caller is one of:
+      - the zone owner (token == WOPI_ACCESS_TOKEN, full read+write access)
+      - a share-link recipient (token matches an active row in `shares`)
+
+    Returns a dict ``{can_write, user_id, user_friendly_name}`` or aborts
+    401/403 if the token is unknown / scoped to a different file / the
+    share-mode forbids what the caller is trying to do (the caller checks
+    the mode against the request method they're handling).
+    """
     token = request.args.get("access_token", "")
-    if token != WOPI_ACCESS_TOKEN:
-        abort(401, description="invalid wopi access_token")
+    if not token:
+        abort(401, description="missing wopi access_token")
+
+    if token == WOPI_ACCESS_TOKEN:
+        return {
+            "can_write": True,
+            "user_id": "owner",
+            "user_friendly_name": "Owner",
+            "share_mode": None,  # owner is implicitly all-modes
+        }
+
+    share = get_share(token)
+    if share is None:
+        abort(401, description="invalid or expired wopi access_token")
+    if share["file_id"] != file_id:
+        # A share token is bound to a single file; reject cross-file misuse.
+        abort(403, description="share token is for a different document")
+
+    # Stable per-share UserId so co-editors get distinct cursor colors.
+    # We hash the token rather than expose it directly so the UserId
+    # itself isn't a credential equivalent.  First 12 hex chars is enough
+    # entropy that two share-recipient cursors won't collide.
+    user_id = "guest-" + hashlib.sha256(token.encode("ascii")).hexdigest()[:12]
+    return {
+        "can_write": share["mode"] == "edit",
+        "user_id": user_id,
+        "user_friendly_name": "Guest",
+        "share_mode": share["mode"],
+    }
 
 
 @app.route("/wopi/files/<file_id>")
 async def wopi_check_file_info(file_id: str):
-    _check_wopi_token()
+    caller = _resolve_wopi_caller(file_id)
     row = get_file_row(file_id)
     if row is None:
         abort(404)
     # The fields below are the ones coolwsd cares about.  Anything else in
     # the WOPI spec we leave unset (sensible defaults assumed).
+    #
+    # ``DisableExport`` / ``DisablePrint`` only apply meaningfully to view
+    # shares — the file's bytes are recoverable from the editor anyway via
+    # copy-paste, so view shares aren't a confidentiality boundary.  We
+    # leave them False (default) to keep the editor experience clean.
     return jsonify(
         {
             "BaseFileName": row["name"],
             "Size": row["size"],
             "OwnerId": "owner",
-            "UserId": "owner",
-            "UserFriendlyName": "Owner",
-            "UserCanWrite": True,
+            "UserId": caller["user_id"],
+            "UserFriendlyName": caller["user_friendly_name"],
+            "UserCanWrite": caller["can_write"],
             "DisableCopy": False,
             "DisableExport": False,
             "DisablePrint": False,
@@ -424,7 +599,9 @@ async def wopi_check_file_info(file_id: str):
 
 @app.route("/wopi/files/<file_id>/contents")
 async def wopi_get_file(file_id: str):
-    _check_wopi_token()
+    # Reading is allowed for any caller that authenticates — a 'view'
+    # share, an 'edit' share, and the owner all need to fetch the bytes.
+    _resolve_wopi_caller(file_id)
     row = get_file_row(file_id)
     if row is None:
         abort(404)
@@ -438,7 +615,13 @@ async def wopi_get_file(file_id: str):
 
 @app.route("/wopi/files/<file_id>/contents", methods=["POST"])
 async def wopi_put_file(file_id: str):
-    _check_wopi_token()
+    caller = _resolve_wopi_caller(file_id)
+    if not caller["can_write"]:
+        # View-share recipients hit this if coolwsd serializes a save
+        # despite UserCanWrite=False.  Reject loudly so the editor
+        # surfaces "your changes were not saved" rather than silently
+        # dropping bytes.
+        abort(403, description="this share is read-only")
     row = get_file_row(file_id)
     if row is None:
         abort(404)
@@ -456,6 +639,238 @@ async def wopi_put_file(file_id: str):
     # WOPI spec: 200 with empty body on PutFile success.  coolwsd accepts
     # JSON or empty; empty is canonical.
     return Response(status=200)
+
+
+# ---------------------------------------------------------------------------
+# Share-link routes (recipient-facing; reachable without OpenHost login)
+# ---------------------------------------------------------------------------
+#
+# Each share token resolves to one of three operations:
+#   /share/v/<token>   — view-only editor
+#   /share/e/<token>   — editable editor
+#   /share/d/<token>   — direct download
+#
+# These routes MUST be reachable without the OpenHost zone-owner cookie,
+# otherwise the recipient (who doesn't have your zone login) gets bounced
+# to /login.  That's wired through ``[routing].public_paths`` in
+# openhost.toml — every URL prefixed with ``/share/`` skips OpenHost's
+# auth gate.  Inside the app we authenticate by the share token in the
+# URL itself, which is mode-scoped and revocable.
+#
+# We deliberately keep the recipient experience cookie-less.  The editor
+# iframe relies on the WOPI access_token query param (which equals the
+# share token) for auth; nothing in the share flow plants a session
+# cookie.  This means a single recipient can be in multiple share links
+# at once and have each link behave according to its own scope.
+# ---------------------------------------------------------------------------
+
+
+def _resolved_share_or_404(token: str, expected_mode: str) -> dict[str, Any]:
+    share = get_share(token)
+    if share is None:
+        # Generic 404 rather than a more specific "expired" / "revoked" so
+        # an attacker probing tokens can't distinguish "wrong" from
+        # "right-but-revoked".  Token shape is checked in get_share.
+        abort(404)
+    if share["mode"] != expected_mode:
+        # Per-mode prefixes are deliberately distinct so /share/e/<t>
+        # cannot be used with a view-only token even if someone hand-edits
+        # the URL.  Still 404 to avoid leaking that the token exists.
+        abort(404)
+    return share
+
+
+@app.route("/share/d/<token>")
+async def share_download(token: str):
+    """Download the raw document bytes via a download-mode share link."""
+    share = _resolved_share_or_404(token, "download")
+    row = get_file_row(share["file_id"])
+    if row is None:
+        abort(404)
+    body = _file_path(row["id"]).read_bytes()
+    mime = mimetypes.guess_type(row["name"])[0] or "application/octet-stream"
+    safe_name = row["name"].encode("ascii", errors="replace").decode("ascii")
+    return Response(
+        body,
+        status=200,
+        headers={
+            "Content-Type": mime,
+            "Content-Disposition": (
+                f'attachment; filename="{safe_name}"; '
+                f"filename*=UTF-8''{row['name'].replace(' ', '%20')}"
+            ),
+        },
+    )
+
+
+@app.route("/share/v/<token>")
+async def share_view(token: str):
+    """Open the document in the editor in read-only mode."""
+    share = _resolved_share_or_404(token, "view")
+    return await _render_share_editor(share, can_write=False)
+
+
+@app.route("/share/e/<token>")
+async def share_edit(token: str):
+    """Open the document in the editor with write access."""
+    share = _resolved_share_or_404(token, "edit")
+    return await _render_share_editor(share, can_write=True)
+
+
+async def _render_share_editor(share: dict[str, Any], *, can_write: bool):
+    row = get_file_row(share["file_id"])
+    if row is None:
+        abort(404)
+    if row["ext"] not in EDITABLE_EXTENSIONS:
+        abort(400, description="this file type is not editable in Collabora")
+    # WOPISrc points at our loopback (same reasoning as the owner-side
+    # /open/<id> route).  The access_token IS the share token — the WOPI
+    # handler validates it against the shares table and applies the
+    # mode-scoped permissions.
+    wopi_src = f"http://127.0.0.1:8080/wopi/files/{row['id']}"
+    cool_url = (
+        f"{PUBLIC_BASE}/browser/dist/cool.html"
+        f"?WOPISrc={wopi_src}"
+        f"&closebutton=false"
+        f"&permission={'edit' if can_write else 'readonly'}"
+    )
+    return await render_template(
+        "editor.html",
+        file=row,
+        cool_url=cool_url,
+        access_token=share["token"],
+        permission=("edit" if can_write else "readonly"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Owner-facing share-management routes (gated by OpenHost zone-owner login)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/manage/<file_id>")
+async def manage_shares_page(file_id: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", file_id):
+        abort(400, description="invalid id")
+    row = get_file_row(file_id)
+    if row is None:
+        abort(404)
+    shares = list_shares_for_file(file_id)
+    rendered = []
+    now = time.time()
+    for s in shares:
+        letter = MODE_TO_LETTER[s["mode"]]
+        share_url = f"{PUBLIC_BASE}/share/{letter}/{s['token']}"
+        if s["expires_at"] is None:
+            expires_human = "never"
+        else:
+            delta = s["expires_at"] - now
+            if delta <= 0:
+                expires_human = "expired"
+            elif delta < 3600:
+                expires_human = f"in {int(delta // 60)} min"
+            elif delta < 86400:
+                expires_human = f"in {int(delta // 3600)} h"
+            else:
+                expires_human = f"in {int(delta // 86400)} days"
+        rendered.append(
+            {
+                **s,
+                "share_url": share_url,
+                "expires_human": expires_human,
+            }
+        )
+    return await render_template(
+        "manage.html",
+        file=row,
+        shares=rendered,
+    )
+
+
+@app.route("/manage/<file_id>/create", methods=["POST"])
+async def create_share_route(file_id: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", file_id):
+        abort(400, description="invalid id")
+    row = get_file_row(file_id)
+    if row is None:
+        abort(404)
+    form = await request.form
+    mode = form.get("mode", "")
+    if mode not in MODE_TO_LETTER:
+        abort(400, description="invalid mode")
+    # View / edit shares only make sense for files Collabora can open.
+    # Download shares work for any file.
+    if mode in ("view", "edit") and row["ext"] not in EDITABLE_EXTENSIONS:
+        abort(400, description="this file type cannot be opened in the editor")
+    # TTL: form sends seconds or empty for "never".  Cap at 10 years to
+    # keep the schema sane.
+    raw_ttl = form.get("ttl_seconds", "")
+    if raw_ttl == "":
+        ttl: int | None = None
+    else:
+        try:
+            ttl = max(0, min(int(raw_ttl), 10 * 365 * 24 * 3600))
+        except ValueError:
+            abort(400, description="invalid ttl")
+    create_share(file_id, mode, ttl)
+    return redirect(url_for("manage_shares_page", file_id=file_id))
+
+
+@app.route("/manage/<file_id>/revoke", methods=["POST"])
+async def revoke_share_route(file_id: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", file_id):
+        abort(400, description="invalid id")
+    form = await request.form
+    token = form.get("token", "")
+    if not token:
+        abort(400, description="missing token")
+    # Look up the share row directly (bypassing get_share's "active only"
+    # filter) so revoking an already-expired or already-revoked row is a
+    # no-op rather than a 404 — the manage UI surfaces those rows and
+    # the user clicking Revoke on them shouldn't see an error.
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT file_id FROM shares WHERE token = ?", (token,)
+        ).fetchone()
+    if row is None:
+        abort(404)
+    # Only allow the owner of this same file to revoke.  Cross-file
+    # revocation is rejected as defence in depth — owner is already
+    # OpenHost-authenticated, so this is paranoia, not a security
+    # boundary.
+    if row["file_id"] != file_id:
+        abort(403, description="token belongs to a different file")
+    revoke_share(token)
+    return redirect(url_for("manage_shares_page", file_id=file_id))
+
+
+@app.route("/manage/<file_id>/extend", methods=["POST"])
+async def extend_share_route(file_id: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", file_id):
+        abort(400, description="invalid id")
+    form = await request.form
+    token = form.get("token", "")
+    raw_ttl = form.get("ttl_seconds", "")
+    if not token:
+        abort(400, description="missing token")
+    if raw_ttl == "":
+        ttl: int | None = None
+    else:
+        try:
+            ttl = max(0, min(int(raw_ttl), 10 * 365 * 24 * 3600))
+        except ValueError:
+            abort(400, description="invalid ttl")
+    # Cross-file scope check (same reasoning as revoke).
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT file_id FROM shares WHERE token = ?", (token,)
+        ).fetchone()
+    if row is None:
+        abort(404)
+    if row["file_id"] != file_id:
+        abort(403, description="token belongs to a different file")
+    extend_share(token, ttl)
+    return redirect(url_for("manage_shares_page", file_id=file_id))
 
 
 # ---------------------------------------------------------------------------

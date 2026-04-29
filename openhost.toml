@@ -1,11 +1,28 @@
 [app]
 name = "collabora"
-version = "0.2.0"
+version = "0.3.0"
 description = "Online office suite (Writer, Calc, Impress) with a built-in file manager — upload, edit, and save documents from your browser. Powered by Collabora Online."
 
 [runtime.container]
 image = "Dockerfile"
 port = 8080
+
+[routing]
+# Share-link recipients don't have an OpenHost zone-owner cookie; without
+# this, the router would 302 them to /login.  Each share URL is itself an
+# unguessable, mode-scoped, revocable token, so making the prefix public
+# is safe.  The /browser/, /cool/, /lool/ prefixes that the editor iframe
+# loads from inside the share view also need to be reachable cookie-less,
+# since they're loaded by the recipient's browser too.
+public_paths = [
+  "/share/",
+  "/browser/",
+  "/cool/",
+  "/lool/",
+  "/wopi/",
+  "/favicon.ico",
+  "/robots.txt",
+]
 
 [resources]
 # LibreOffice document processes are RAM-hungry.  2 GB is enough for a few

@@ -22,7 +22,7 @@
   -->
   <form id="cool-form" action="{{ cool_url }}" method="POST" target="cool-iframe" style="display:none">
     <input type="hidden" name="access_token" value="{{ access_token }}" />
-    <input type="hidden" name="permission" value="edit" />
+    <input type="hidden" name="permission" value="{{ permission|default('edit') }}" />
     <input type="hidden" name="lang" value="en" />
   </form>
   <iframe id="cool-iframe" name="cool-iframe" allow="clipboard-read; clipboard-write" allowfullscreen></iframe>

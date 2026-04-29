@@ -128,6 +128,7 @@
             <a href="/open/{{ f.id }}">Open</a>
             {% endif %}
             <a href="/download/{{ f.id }}">Download</a>
+            <a href="/manage/{{ f.id }}">Share</a>
             <form method="POST" action="/delete/{{ f.id }}" onsubmit="return confirm('Delete {{ f.name|e }}?')" style="display:inline">
               <button type="submit" class="danger">Delete</button>
             </form>

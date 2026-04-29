@@ -14,7 +14,9 @@ A single container running two processes:
 - **coolwsd** — Collabora's editor backend, on `127.0.0.1:9980` (loopback only).
 - **Quart** — a small Python web app on `0.0.0.0:8080` that serves:
   - `/`                            — the file list
-  - `/upload`, `/new/<kind>`, `/delete/<id>`, `/download/<id>`, `/open/<id>` — file-management routes
+  - `/upload`, `/new/<kind>`, `/delete/<id>`, `/download/<id>`, `/open/<id>` — file-management routes (owner only, gated by OpenHost login)
+  - `/manage/<id>`, `/manage/<id>/{create,revoke,extend}` — share-link administration (owner only)
+  - `/share/v/<token>`, `/share/e/<token>`, `/share/d/<token>` — recipient-facing share routes (no OpenHost login required; auth is the token)
   - `/wopi/files/<id>`, `/wopi/files/<id>/contents` — the WOPI host endpoints coolwsd talks to during edits
   - `/browser/`, `/cool/`, `/lool/`, `/hosting/`, `/favicon.ico`, `/robots.txt` — reverse-proxied to coolwsd (HTTP and WebSocket)
 
@@ -29,18 +31,32 @@ from outside the container is through the Quart proxy.
   `.ods` / `.odp` and drops you straight into the editor.
 - Click an editable file → opens the Collabora editor in an iframe.  Save
   in the editor → file in the list updates (size + mtime change).
+- **Per-document share links.**  From the file list click *Share* → pick
+  one of: *view-only*, *view & edit*, *download*.  Each click mints an
+  unguessable, mode-scoped, revocable URL with a default 30-day expiry.
+  Recipients open the link without an OpenHost login.  Edit-share
+  recipients editing the same file at the same time see each other's
+  cursors live (Collabora's built-in real-time co-editing); each share
+  link gets a stable distinct UserId so cursors are coloured per link.
 
 ## What deliberately doesn't work (yet)
 
 - No folders, multi-select, sort, search, rename.
-- No multi-user / sharing / per-document permissions.  Whoever has the
-  OpenHost zone-owner cookie sees and edits everything.
+- No per-recipient identity.  Share links are fungible: if you mail one
+  link to three people, the editor shows them all as "Guest" (with one
+  shared UserId per link → one shared cursor colour across those three
+  recipients).  Distinguishing recipients would require a real account
+  system; OpenHost is single-owner so that has to live inside this app,
+  and it's out of scope for "barebones".
+- No notification / email out.  The owner copies the share URL out of
+  the manage page and sends it manually (Signal, email, etc.).
 - No version history.  PutFile overwrites the document atomically; old
   bytes are gone.
 - No file type other than the ones Collabora can edit (Writer / Calc /
   Impress family).  You can upload anything via `/upload` and download
   it via `/download/<id>`, but only office-document extensions show an
-  "Open" link.
+  "Open" link, and only office-document files can be view-/edit-shared
+  (download shares work for any file type).
 
 ## Persistent state
 
@@ -72,15 +88,35 @@ Two things to know:
    For a single-user / single-tenant zone (you and your own files), this
    is the same threat model as running LibreOffice locally.
 
-2. **Authentication is the OpenHost zone-owner cookie.**  All UI routes
-   are gated by OpenHost's regular login.  The WOPI endpoints
-   (`/wopi/files/<id>`, `/wopi/files/<id>/contents`) are gated by an
-   in-process random `access_token` instead — they have to be reachable
-   without an OpenHost cookie because coolwsd inside the same container
-   calls them with no session of its own.  That token is generated fresh
-   on every container start.  It's not a security boundary against an
-   attacker who can already MITM the loopback interface, but it does
-   reject accidental WOPI calls from unrelated apps on the same host.
+2. **Authentication has two layers: OpenHost cookie + share tokens.**
+   - **Owner routes** (`/`, `/upload`, `/new`, `/open`, `/manage`, ...)
+     are gated by OpenHost's regular zone-owner login.
+   - **Share routes** (`/share/v/<token>`, `/share/e/<token>`,
+     `/share/d/<token>`) are reachable without an OpenHost cookie; the
+     token in the URL is itself the credential.  Tokens are 24-byte
+     URL-safe random strings, scoped to a single file and a single mode
+     (view / edit / download), with a default 30-day expiry, revocable
+     from the manage page.
+   - **WOPI endpoints** accept either the in-process owner WOPI token
+     (regenerated on every container start) or a share token; coolwsd
+     supplies whichever was baked into the editor URL it was launched
+     with.  Share tokens get `UserCanWrite=False` for view shares,
+     `UserCanWrite=True` for edit shares.
+
+   What that means in practice:
+   - A view-share link is a "see this document" capability; the holder
+     can read the contents and copy text out of the editor (no DRM —
+     this isn't trying to be).
+   - An edit-share link is a "co-edit this document" capability; the
+     holder can change the bytes.  All edits go through the same
+     atomic-replace WOPI handler, so concurrent saves either succeed
+     cleanly or fail loudly.
+   - A download-share link is a "fetch the bytes once, in the original
+     format" capability.  It's the simplest kind to revoke because the
+     recipient has to use it before you revoke it; once the bytes are
+     downloaded they're out of your hands.
+   - Anyone who learns a share URL gets the access it grants until you
+     revoke it.  Treat URLs accordingly: paste into Signal, not Twitter.
 
 ## Resources
 
@@ -116,10 +152,11 @@ spreadsheets.
 ├── scripts/
 │   └── generate-blank-templates.sh    # build-time: creates blank.{odt,ods,odp}
 └── app/
-    ├── server.py                      # Quart UI + WOPI host + reverse proxy
+    ├── server.py                      # Quart UI + WOPI host + share tokens + reverse proxy
     └── templates/
         ├── index.html                 # file list
-        └── editor.html                # iframe shell that POSTs to coolwsd
+        ├── editor.html                # iframe shell that POSTs to coolwsd
+        └── manage.html                # per-document share-link admin page
 ```
 
 ## Upstream
