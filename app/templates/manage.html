@@ -28,9 +28,21 @@
     .new-share legend { font-weight: 600; font-size: 0.9em; margin-bottom: 8px; }
     .new-share label { margin-right: 16px; cursor: pointer; }
     .new-share .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    /* Force the same box model on the radio-row select+button so the
+       "Create link" button doesn't sit a pixel taller than the
+       <select> next to it.  Without this, browsers ship slightly
+       different defaults for form-control heights. */
     .new-share select, .new-share button {
-      padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px;
-      background: #fff; font: inherit;
+      display: inline-flex;
+      align-items: center;
+      box-sizing: border-box;
+      height: 36px;
+      padding: 0 12px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fff;
+      font: inherit;
+      line-height: 1;
     }
     .new-share button { cursor: pointer; }
     table { width: 100%; border-collapse: collapse; }
@@ -50,23 +62,46 @@
     .badge.edit     { background: #fef0d6; color: #835400; }
     .badge.download { background: #eef; color: #336; }
     .badge.dead     { background: #fee; color: #a33; }
-    .url-box {
-      display: flex; gap: 6px; align-items: center; max-width: 500px;
+    .url-box { display: flex; gap: 6px; align-items: center; max-width: 500px; }
+    .url-box input, .url-box button {
+      box-sizing: border-box;
+      height: 28px;
+      font-size: 0.8em;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      line-height: 1;
     }
     .url-box input {
-      flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 0.8em; padding: 4px 8px; border: 1px solid #ddd;
-      border-radius: 4px; background: #f5f5f5;
+      flex: 1;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      padding: 0 8px;
+      background: #f5f5f5;
     }
     .url-box button {
-      padding: 4px 10px; font-size: 0.85em; border: 1px solid #ccc;
-      background: #fff; border-radius: 4px; cursor: pointer;
-    }
-    .row-actions { display: flex; gap: 8px; justify-content: flex-end; }
-    .row-actions button {
-      padding: 4px 10px; font-size: 0.85em; border: 1px solid #ccc;
-      background: #fff; border-radius: 4px; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 0 10px;
+      font-size: 0.85em;
       font-family: inherit;
+      border: 1px solid #ccc;
+      background: #fff;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .row-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+    .row-actions form { margin: 0; display: inline-flex; }
+    .row-actions button {
+      display: inline-flex; align-items: center; justify-content: center;
+      box-sizing: border-box;
+      height: 28px;
+      padding: 0 10px;
+      font-size: 0.85em;
+      font-family: inherit;
+      line-height: 1;
+      border: 1px solid #ccc;
+      background: #fff;
+      border-radius: 4px;
+      cursor: pointer;
+      white-space: nowrap;
     }
     .row-actions button.danger { color: #a33; border-color: #d99; }
     @media (prefers-color-scheme: dark) {

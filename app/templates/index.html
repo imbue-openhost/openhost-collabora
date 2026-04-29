@@ -74,16 +74,29 @@
       margin-left: 8px;
       text-transform: uppercase;
     }
-    .row-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .row-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+    /* The Delete control is a <button> wrapped in an inline <form>;
+       Open/Download/Share are bare <a>s.  Force a shared box model on
+       both so the row stays visually flush. */
+    .row-actions form { margin: 0; display: inline-flex; }
     .row-actions a, .row-actions button {
-      padding: 4px 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
+      height: 28px;
+      padding: 0 10px;
       font-size: 0.85em;
+      font-family: inherit;
+      line-height: 1;
       border: 1px solid #ccc;
       background: #fff;
       border-radius: 4px;
       cursor: pointer;
       text-decoration: none;
       color: inherit;
+      white-space: nowrap;
+      vertical-align: middle;
     }
     .row-actions button.danger { color: #a33; border-color: #d99; }
     @media (prefers-color-scheme: dark) {
