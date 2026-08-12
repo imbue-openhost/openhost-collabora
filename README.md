@@ -1,6 +1,6 @@
-# openhost-collabora
+# bottled-collabora
 
-Online office suite (Writer / Calc / Impress) for your OpenHost zone.
+Online office suite (Writer / Calc / Impress) for your Cloud in a Bottle zone.
 Upload or create documents, click to edit them in the browser, save back
 to the same list.  No external file server needed — the file manager and
 the Collabora editor backend ship together in one container.
@@ -14,13 +14,13 @@ A single container running two processes:
 - **coolwsd** — Collabora's editor backend, on `127.0.0.1:9980` (loopback only).
 - **Quart** — a small Python web app on `0.0.0.0:8080` that serves:
   - `/`                            — the file list
-  - `/upload`, `/new/<kind>`, `/delete/<id>`, `/download/<id>`, `/open/<id>` — file-management routes (owner only, gated by OpenHost login)
+  - `/upload`, `/new/<kind>`, `/delete/<id>`, `/download/<id>`, `/open/<id>` — file-management routes (owner only, gated by Cloud in a Bottle login)
   - `/manage/<id>`, `/manage/<id>/{create,revoke,extend}` — share-link administration (owner only)
-  - `/share/v/<token>`, `/share/e/<token>`, `/share/d/<token>` — recipient-facing share routes (no OpenHost login required; auth is the token)
+  - `/share/v/<token>`, `/share/e/<token>`, `/share/d/<token>` — recipient-facing share routes (no Cloud in a Bottle login required; auth is the token)
   - `/wopi/files/<id>`, `/wopi/files/<id>/contents` — the WOPI host endpoints coolwsd talks to during edits
   - `/browser/`, `/cool/`, `/lool/`, `/hosting/`, `/favicon.ico`, `/robots.txt` — reverse-proxied to coolwsd (HTTP and WebSocket)
 
-Everything reaches the user through the single `8080` port that OpenHost
+Everything reaches the user through the single `8080` port that Cloud in a Bottle
 publishes.  `coolwsd` is loopback-only; the only way to reach the editor
 from outside the container is through the Quart proxy.
 
@@ -34,7 +34,7 @@ from outside the container is through the Quart proxy.
 - **Per-document share links.**  From the file list click *Share* → pick
   one of: *view-only*, *view & edit*, *download*.  Each click mints an
   unguessable, mode-scoped, revocable URL with a default 30-day expiry.
-  Recipients open the link without an OpenHost login.  Edit-share
+  Recipients open the link without a Cloud in a Bottle login.  Edit-share
   recipients editing the same file at the same time see each other's
   cursors live (Collabora's built-in real-time co-editing); each share
   link gets a stable distinct UserId so cursors are coloured per link.
@@ -46,7 +46,7 @@ from outside the container is through the Quart proxy.
   link to three people, the editor shows them all as "Guest" (with one
   shared UserId per link → one shared cursor colour across those three
   recipients).  Distinguishing recipients would require a real account
-  system; OpenHost is single-owner so that has to live inside this app,
+  system; Cloud in a Bottle is single-owner so that has to live inside this app,
   and it's out of scope for "barebones".
 - No notification / email out.  The owner copies the share URL out of
   the manage page and sends it manually (Signal, email, etc.).
@@ -78,9 +78,9 @@ Two things to know:
 1. **Process isolation is weaker than upstream.**  The standard Collabora
    deployment uses a `CAP_SYS_ADMIN` mount jail plus a custom seccomp
    profile to isolate document-rendering child processes.  Rootless
-   OpenHost provides neither, so this image disables both:
+   Cloud in a Bottle provides neither, so this image disables both:
    `--o:security.capabilities=false`, `--o:security.seccomp=false`.
-   Process isolation falls back to the OpenHost user namespace plus
+   Process isolation falls back to the Cloud in a Bottle user namespace plus
    `no_new_privileges=true`.  This is **weaker** than upstream's default:
    a LibreOffice document-rendering bug that escapes the per-document
    forkit could read other documents the same container has loaded.  Do
@@ -88,11 +88,11 @@ Two things to know:
    For a single-user / single-tenant zone (you and your own files), this
    is the same threat model as running LibreOffice locally.
 
-2. **Authentication has two layers: OpenHost cookie + share tokens.**
+2. **Authentication has two layers: Cloud in a Bottle cookie + share tokens.**
    - **Owner routes** (`/`, `/upload`, `/new`, `/open`, `/manage`, ...)
-     are gated by OpenHost's regular zone-owner login.
+     are gated by Cloud in a Bottle's regular zone-owner login.
    - **Share routes** (`/share/v/<token>`, `/share/e/<token>`,
-     `/share/d/<token>`) are reachable without an OpenHost cookie; the
+     `/share/d/<token>`) are reachable without a Cloud in a Bottle cookie; the
      token in the URL is itself the credential.  Tokens are 24-byte
      URL-safe random strings, scoped to a single file and a single mode
      (view / edit / download), with a default 30-day expiry, revocable
@@ -124,14 +124,14 @@ The defaults are 2 GB RAM / 2 CPUs.  LibreOffice's per-document RAM
 appetite is real; bump higher under heavy concurrent editing or large
 spreadsheets.
 
-## Limitations inherited from OpenHost
+## Limitations inherited from Cloud in a Bottle
 
-- `[resources].gpu = true` is not honoured by the OpenHost router (it
+- `[resources].gpu = true` is not honoured by the Cloud in a Bottle router (it
   stores the field but never adds the device flag).
-- `--shm-size` cannot be configured via the OpenHost manifest; the
+- `--shm-size` cannot be configured via the Cloud in a Bottle manifest; the
   container uses the rootless-podman default (64 MiB).  Sufficient for
   typical document workloads.
-- Logs are not rotated by OpenHost; the container's stdout/stderr append
+- Logs are not rotated by Cloud in a Bottle; the container's stdout/stderr append
   unbounded to `docker.log` until the next reload.
 
 ## Configuration
