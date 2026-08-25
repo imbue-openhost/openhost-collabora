@@ -551,6 +551,13 @@ async def editor_page(file_id: str):
 # ``UserCanNotWriteRelative=True`` for them, so a guest can never create an
 # owner-owned file — the two checks are belt-and-suspenders.  501 is reserved
 # for a genuinely unimplemented override (the dispatcher's final fallback).
+#
+# WOPI proof-key validation (X-WOPI-Proof: the host verifying that requests
+# are RSA-signed by the paired WOPI client) is intentionally NOT implemented.
+# Every /wopi/ call is already gated by an unguessable capability token (the
+# per-container owner token or a scoped share token), which is a simpler and
+# sufficient boundary for this single-owner app.  The Microsoft WOPI
+# validator's ProofKeys tests therefore fail by design.
 # ---------------------------------------------------------------------------
 
 # In-memory advisory locks, keyed by file_id → opaque lock string chosen by
@@ -689,8 +696,7 @@ async def wopi_put_file(file_id: str):
         abort(403, description="this share is read-only")
     # Lock check: honour the lock only when one is actually held AND the
     # caller supplied a mismatching lock.  coolwsd holds its own lock and
-    # echoes it here, so this passes; a save with no lock in play (the
-    # historical behaviour) still goes through unchanged.
+    # echoes it here, so this passes.
     current_lock = _locks.get(file_id)
     provided_lock = _lock_header()
     if current_lock is not None and provided_lock and provided_lock != current_lock:
@@ -698,6 +704,12 @@ async def wopi_put_file(file_id: str):
     row = get_file_row(file_id)
     if row is None:
         abort(404)
+    # WOPI: PutFile against an UNLOCKED file is only valid when the file is
+    # currently 0 bytes; a non-empty unlocked file must be locked first, so
+    # return 409 and let the client lock + retry.  coolwsd always locks before
+    # editing, so in practice this only rejects out-of-protocol writers.
+    if current_lock is None and row["size"] > 0:
+        return _lock_conflict(file_id)
     body = await request.get_data()
     dest = _file_path(file_id)
     # Atomic replace: write to a sibling tempfile, fsync, rename.  Otherwise
