@@ -40,6 +40,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import websockets
@@ -196,6 +197,14 @@ def update_file_size(file_id: str, size: int, mtime: float) -> None:
         conn.execute(
             "UPDATE files SET size = ?, mtime = ? WHERE id = ?",
             (size, mtime, file_id),
+        )
+
+
+def rename_file_row(file_id: str, name: str, mtime: float) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE files SET name = ?, mtime = ? WHERE id = ?",
+            (name, mtime, file_id),
         )
 
 
@@ -490,10 +499,12 @@ async def editor_page(file_id: str):
     # container; using loopback avoids a hairpin trip out through the
     # OpenHost router and back to ourselves, plus it sidesteps any
     # outbound DNS/firewall surprises.
+    # WOPISrc must be percent-encoded in the cool.html query string; coolwsd
+    # rejects (older builds) or warns on (current) an unencoded value.
     wopi_src = f"http://127.0.0.1:8080/wopi/files/{file_id}"
     cool_url = (
         f"{PUBLIC_BASE}/browser/dist/cool.html"
-        f"?WOPISrc={wopi_src}"
+        f"?WOPISrc={quote(wopi_src, safe='')}"
         f"&closebutton=true"
     )
     return await render_template(
@@ -509,18 +520,57 @@ async def editor_page(file_id: str):
 # WOPI host
 # ---------------------------------------------------------------------------
 #
-# coolwsd calls these three endpoints during an edit session.  The protocol
-# is documented at https://learn.microsoft.com/en-us/microsoft-365/cloud-
-# storage-partner-program/online/wopi-rest-apis.  We implement the strict
-# minimum that makes the editor load and save:
+# coolwsd calls these endpoints during an edit session.  WOPI is a closed,
+# fully-specified protocol (Microsoft CSPP) that lives in exactly two URL
+# shapes — ``/wopi/files/<id>`` and ``/wopi/files/<id>/contents`` — with the
+# non-GET operations multiplexed onto ``POST /wopi/files/<id>`` and keyed by
+# the ``X-WOPI-Override`` header.  We implement the complete set coolwsd can
+# emit:
 #
-#   GET  /wopi/files/<id>            → CheckFileInfo (metadata)
+#   GET  /wopi/files/<id>            → CheckFileInfo (metadata + capabilities)
 #   GET  /wopi/files/<id>/contents   → GetFile  (raw bytes)
 #   POST /wopi/files/<id>/contents   → PutFile  (overwrite raw bytes)
+#   POST /wopi/files/<id>            → dispatched on X-WOPI-Override:
+#       RENAME_FILE                    rename (keeps the extension)
+#       LOCK / UNLOCK / REFRESH_LOCK   advisory per-file lock
+#       GET_LOCK                       report the current lock
+#       DELETE                         delete the file
+#       PUT_RELATIVE                   Save-As — declined (see below)
+#
+# Anything outside that set returns a *loud* 501 with the override name
+# logged, so a protocol addition (or a caller bug) announces itself in the
+# logs instead of surfacing to the user as a mysterious "expired session"
+# (which is what a bare 404 on a save-path call renders as).
 #
 # We accept either ``access_token`` query param or ``Authorization: Bearer``.
 # coolwsd uses the query param.
+#
+# We deliberately do NOT implement PutRelativeFile ("Save As" / export to a
+# new stored file).  Instead CheckFileInfo advertises
+# ``UserCanNotWriteRelative=True`` so coolwsd never offers the affordance;
+# the 501 handler is belt-and-suspenders for a client that tries anyway.
 # ---------------------------------------------------------------------------
+
+# In-memory advisory locks, keyed by file_id → opaque lock string chosen by
+# the client (coolwsd).  A WOPI lock's lifetime is a single edit session; if
+# the container restarts every session is torn down anyway, so there is
+# nothing to persist.  hypercorn runs one worker on one event loop and no
+# lock handler awaits between reading and mutating this dict, so plain dict
+# operations are atomic — no mutex needed.
+_locks: dict[str, str] = {}
+
+
+def _lock_header() -> str:
+    return request.headers.get("X-WOPI-Lock", "")
+
+
+def _lock_conflict(file_id: str) -> Response:
+    """WOPI lock-conflict response: 409 carrying the *current* lock so the
+    caller can see who holds it.  An empty header means the file is unlocked.
+    """
+    resp = Response(status=409)
+    resp.headers["X-WOPI-Lock"] = _locks.get(file_id, "")
+    return resp
 
 
 def _resolve_wopi_caller(file_id: str) -> dict[str, Any]:
@@ -589,6 +639,17 @@ async def wopi_check_file_info(file_id: str):
             "UserId": caller["user_id"],
             "UserFriendlyName": caller["user_friendly_name"],
             "UserCanWrite": caller["can_write"],
+            # Capability advertisement — this is how the host tells coolwsd
+            # which write-family operations it may attempt.  Only advertise
+            # what POST /wopi/files/<id> actually implements: rename, locks,
+            # in-place update.  Save-As (PutRelativeFile) is NOT implemented,
+            # so UserCanNotWriteRelative=True suppresses that affordance.
+            "UserCanRename": caller["can_write"],
+            "SupportsRename": True,
+            "SupportsLocks": True,
+            "SupportsGetLock": True,
+            "SupportsUpdate": True,
+            "UserCanNotWriteRelative": True,
             "DisableCopy": False,
             "DisableExport": False,
             "DisablePrint": False,
@@ -622,6 +683,14 @@ async def wopi_put_file(file_id: str):
         # surfaces "your changes were not saved" rather than silently
         # dropping bytes.
         abort(403, description="this share is read-only")
+    # Lock check: honour the lock only when one is actually held AND the
+    # caller supplied a mismatching lock.  coolwsd holds its own lock and
+    # echoes it here, so this passes; a save with no lock in play (the
+    # historical behaviour) still goes through unchanged.
+    current_lock = _locks.get(file_id)
+    provided_lock = _lock_header()
+    if current_lock is not None and provided_lock and provided_lock != current_lock:
+        return _lock_conflict(file_id)
     row = get_file_row(file_id)
     if row is None:
         abort(404)
@@ -638,6 +707,135 @@ async def wopi_put_file(file_id: str):
     update_file_size(file_id, len(body), time.time())
     # WOPI spec: 200 with empty body on PutFile success.  coolwsd accepts
     # JSON or empty; empty is canonical.
+    return Response(status=200)
+
+
+@app.route("/wopi/files/<file_id>", methods=["POST"])
+async def wopi_files_op(file_id: str):
+    """Dispatch the WOPI operations multiplexed onto POST /wopi/files/<id>.
+
+    The operation is selected by the ``X-WOPI-Override`` header.  This is the
+    complete closed set coolwsd can emit against the file endpoint; an
+    override we don't recognise returns a logged 501 rather than a bare 404,
+    so nothing can fail silently as an "expired session".
+    """
+    caller = _resolve_wopi_caller(file_id)
+    row = get_file_row(file_id)
+    if row is None:
+        abort(404)
+    override = request.headers.get("X-WOPI-Override", "").upper()
+
+    if override == "GET_LOCK":
+        # Read-only: any authenticated caller may query the lock state.
+        resp = Response(status=200)
+        resp.headers["X-WOPI-Lock"] = _locks.get(file_id, "")
+        return resp
+
+    # Everything below mutates state or takes a lock — writers only.
+    if not caller["can_write"]:
+        abort(403, description="this share is read-only")
+
+    if override == "LOCK":
+        return _wopi_lock(file_id)
+    if override == "UNLOCK":
+        return _wopi_unlock(file_id)
+    if override == "REFRESH_LOCK":
+        return _wopi_refresh_lock(file_id)
+    if override == "RENAME_FILE":
+        return _wopi_rename(file_id, row)
+    if override == "DELETE":
+        return _wopi_delete(file_id)
+    if override == "PUT_RELATIVE":
+        # Save-As.  Not implemented; CheckFileInfo advertises
+        # UserCanNotWriteRelative=True so coolwsd should never send this.
+        app.logger.info("declining WOPI PUT_RELATIVE (Save-As) on file %s", file_id)
+        return Response("Save As is not supported", status=501)
+
+    app.logger.warning(
+        "unimplemented WOPI override %r on file %s", override or "(none)", file_id
+    )
+    return Response(f"unimplemented WOPI override: {override or '(none)'}", status=501)
+
+
+def _wopi_lock(file_id: str) -> Response:
+    """LOCK, and UnlockAndRelock when X-WOPI-OldLock is present."""
+    requested = _lock_header()
+    old = request.headers.get("X-WOPI-OldLock")
+    current = _locks.get(file_id)
+    if old is not None:
+        # UnlockAndRelock: the caller must currently hold ``old``.
+        if current != old:
+            return _lock_conflict(file_id)
+        _locks[file_id] = requested
+        return Response(status=200)
+    # Plain lock.  Re-locking with the same string is an idempotent success.
+    if current is None or current == requested:
+        _locks[file_id] = requested
+        return Response(status=200)
+    return _lock_conflict(file_id)
+
+
+def _wopi_unlock(file_id: str) -> Response:
+    requested = _lock_header()
+    current = _locks.get(file_id)
+    if current is None or current != requested:
+        return _lock_conflict(file_id)
+    _locks.pop(file_id, None)
+    return Response(status=200)
+
+
+def _wopi_refresh_lock(file_id: str) -> Response:
+    requested = _lock_header()
+    current = _locks.get(file_id)
+    if current is None or current != requested:
+        return _lock_conflict(file_id)
+    # No TTL is tracked, so refresh is a success no-op.
+    return Response(status=200)
+
+
+def _wopi_rename(file_id: str, row: dict[str, Any]) -> Response:
+    """RENAME_FILE: change the stored filename, preserving the extension.
+
+    coolwsd sends the new *base* name (no extension) in X-WOPI-RequestedName.
+    The spec nominally UTF-7-encodes it, but Collabora sends UTF-8/ASCII in
+    practice and our filename allowlist rejects anything exotic, so we treat
+    it as text.  We re-append the file's current extension so a rename can
+    never change the document type.
+    """
+    current = _locks.get(file_id)
+    provided = _lock_header()
+    if current is not None and provided and provided != current:
+        return _lock_conflict(file_id)
+
+    requested = request.headers.get("X-WOPI-RequestedName", "").strip()
+    if not requested:
+        abort(400, description="missing X-WOPI-RequestedName")
+    ext = row["ext"]
+    # Defensive: if the client included the current extension, drop it before
+    # we re-append it.
+    if ext and requested.lower().endswith("." + ext):
+        requested = requested[: -(len(ext) + 1)]
+    new_name = f"{requested}.{ext}" if ext else requested
+    new_name = _validated_name(new_name)  # aborts 400 on a bad name
+
+    rename_file_row(file_id, new_name, time.time())
+    # Response body per spec: the new base name without extension.
+    base = new_name[: -(len(ext) + 1)] if ext else new_name
+    return jsonify({"Name": base})
+
+
+def _wopi_delete(file_id: str) -> Response:
+    current = _locks.get(file_id)
+    provided = _lock_header()
+    if current is not None and provided and provided != current:
+        return _lock_conflict(file_id)
+    dest = _file_path(file_id)
+    try:
+        dest.unlink()
+    except FileNotFoundError:
+        pass
+    delete_file_row(file_id)
+    _locks.pop(file_id, None)
     return Response(status=200)
 
 
@@ -730,7 +928,7 @@ async def _render_share_editor(share: dict[str, Any], *, can_write: bool):
     wopi_src = f"http://127.0.0.1:8080/wopi/files/{row['id']}"
     cool_url = (
         f"{PUBLIC_BASE}/browser/dist/cool.html"
-        f"?WOPISrc={wopi_src}"
+        f"?WOPISrc={quote(wopi_src, safe='')}"
         f"&closebutton=false"
         f"&permission={'edit' if can_write else 'readonly'}"
     )
