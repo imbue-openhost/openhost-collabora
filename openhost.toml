@@ -28,7 +28,7 @@ public_paths = [
 # LibreOffice document processes are RAM-hungry.  2 GB is enough for a few
 # concurrent documents; bump higher for heavy use.
 memory_mb = 2048
-cpu_millicores = 2000
+cpu_cores = 2.0
 
 [data]
 # Documents the user uploads/creates live here, plus a tiny sqlite index.
