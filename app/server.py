@@ -545,10 +545,10 @@ async def editor_page(file_id: str):
 # We accept either ``access_token`` query param or ``Authorization: Bearer``.
 # coolwsd uses the query param.
 #
-# We deliberately do NOT implement PutRelativeFile ("Save As" / export to a
-# new stored file).  Instead CheckFileInfo advertises
-# ``UserCanNotWriteRelative=True`` so coolwsd never offers the affordance;
-# the 501 handler is belt-and-suspenders for a client that tries anyway.
+# PutRelativeFile ("Save As" → a new stored file) is implemented for the
+# OWNER only.  For share-link callers it is refused (501) and CheckFileInfo
+# advertises ``UserCanNotWriteRelative=True`` for them, so a guest can never
+# create an owner-owned file — the two checks are belt-and-suspenders.
 # ---------------------------------------------------------------------------
 
 # In-memory advisory locks, keyed by file_id → opaque lock string chosen by
@@ -649,7 +649,9 @@ async def wopi_check_file_info(file_id: str):
             "SupportsLocks": True,
             "SupportsGetLock": True,
             "SupportsUpdate": True,
-            "UserCanNotWriteRelative": True,
+            # Owner may Save-As (PutRelativeFile); share recipients may not,
+            # which also keeps coolwsd from offering them the affordance.
+            "UserCanNotWriteRelative": caller.get("share_mode") is not None,
             "DisableCopy": False,
             "DisableExport": False,
             "DisablePrint": False,
@@ -746,10 +748,14 @@ async def wopi_files_op(file_id: str):
     if override == "DELETE":
         return _wopi_delete(file_id)
     if override == "PUT_RELATIVE":
-        # Save-As.  Not implemented; CheckFileInfo advertises
-        # UserCanNotWriteRelative=True so coolwsd should never send this.
-        app.logger.info("declining WOPI PUT_RELATIVE (Save-As) on file %s", file_id)
-        return Response("Save As is not supported", status=501)
+        if caller.get("share_mode") is not None:
+            # Save-As from a share link would create an owner-owned file from
+            # a guest action.  Refused — CheckFileInfo also advertises
+            # UserCanNotWriteRelative for share callers, so coolwsd shouldn't
+            # even offer it.
+            app.logger.info("declining share-caller PUT_RELATIVE on file %s", file_id)
+            return Response("Save As is not available for share links", status=501)
+        return await _wopi_put_relative(row)
 
     app.logger.warning(
         "unimplemented WOPI override %r on file %s", override or "(none)", file_id
@@ -837,6 +843,91 @@ def _wopi_delete(file_id: str) -> Response:
     delete_file_row(file_id)
     _locks.pop(file_id, None)
     return Response(status=200)
+
+
+def _name_exists(name: str) -> bool:
+    with _connect() as conn:
+        return (
+            conn.execute(
+                "SELECT 1 FROM files WHERE name = ? LIMIT 1", (name,)
+            ).fetchone()
+            is not None
+        )
+
+
+def _dedupe_name(name: str) -> str:
+    """Return ``name`` if unused, else ``stem (1).ext``, ``stem (2).ext`` …"""
+    if not _name_exists(name):
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    n = 1
+    while True:
+        candidate = f"{stem} ({n}).{ext}" if ext else f"{stem} ({n})"
+        if not _name_exists(candidate):
+            return candidate
+        n += 1
+
+
+async def _wopi_put_relative(row: dict[str, Any]) -> Response:
+    """PUT_RELATIVE (Save-As): create a NEW stored file from the posted bytes
+    and return a WOPI Url the editor switches its session to.  Owner-only
+    (the dispatcher rejects share callers before we get here).
+
+    Two mutually-exclusive modes per the WOPI spec:
+      - X-WOPI-SuggestedTarget: a full name, or just an extension (".pdf").
+        The host may adjust the name to dodge a collision.
+      - X-WOPI-RelativeTarget: an exact name.  A collision is a 409 (unless
+        X-WOPI-OverwriteRelativeTarget is true), carrying
+        X-WOPI-ValidRelativeTarget with a free name.
+    """
+    suggested = request.headers.get("X-WOPI-SuggestedTarget", "").strip()
+    relative = request.headers.get("X-WOPI-RelativeTarget", "").strip()
+    overwrite = (
+        request.headers.get("X-WOPI-OverwriteRelativeTarget", "").lower() == "true"
+    )
+    if bool(suggested) == bool(relative):
+        # Exactly one of the two must be present.
+        abort(400, description="need exactly one of Suggested/RelativeTarget")
+
+    if suggested:
+        if suggested.startswith("."):
+            # Extension only → keep the source base name, swap the extension.
+            base = row["name"][: -(len(row["ext"]) + 1)] if row["ext"] else row["name"]
+            desired = f"{base}{suggested}"
+        else:
+            desired = suggested
+        name = _dedupe_name(_validated_name(desired))
+    else:
+        name = _validated_name(relative)
+        if _name_exists(name) and not overwrite:
+            resp = Response(status=409)
+            resp.headers["X-WOPI-ValidRelativeTarget"] = _dedupe_name(name)
+            return resp
+
+    body = await request.get_data()
+    new_id = uuid.uuid4().hex
+    dest = _file_path(new_id)
+    # Atomic write, same as PutFile.
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    with tmp.open("wb") as out:
+        out.write(body)
+        out.flush()
+        os.fsync(out.fileno())
+    tmp.replace(dest)
+    insert_file(new_id, name, len(body), _ext_of(name), time.time())
+
+    # The Url must carry an access_token the editor can immediately reuse for
+    # the new file; for the owner that's the in-process owner WOPI token.
+    new_wopi_src = f"{PUBLIC_BASE}/wopi/files/{new_id}"
+    return jsonify(
+        {
+            "Name": name,
+            "Url": f"{new_wopi_src}?access_token={quote(WOPI_ACCESS_TOKEN, safe='')}",
+            "HostEditUrl": f"{PUBLIC_BASE}/open/{new_id}",
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
