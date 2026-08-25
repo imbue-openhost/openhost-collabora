@@ -546,9 +546,11 @@ async def editor_page(file_id: str):
 # coolwsd uses the query param.
 #
 # PutRelativeFile ("Save As" → a new stored file) is implemented for the
-# OWNER only.  For share-link callers it is refused (501) and CheckFileInfo
-# advertises ``UserCanNotWriteRelative=True`` for them, so a guest can never
-# create an owner-owned file — the two checks are belt-and-suspenders.
+# OWNER only.  For share-link callers it is forbidden (403 — the op exists,
+# they're just not allowed it) and CheckFileInfo advertises
+# ``UserCanNotWriteRelative=True`` for them, so a guest can never create an
+# owner-owned file — the two checks are belt-and-suspenders.  501 is reserved
+# for a genuinely unimplemented override (the dispatcher's final fallback).
 # ---------------------------------------------------------------------------
 
 # In-memory advisory locks, keyed by file_id → opaque lock string chosen by
@@ -759,11 +761,12 @@ async def wopi_files_op(file_id: str):
     if override == "PUT_RELATIVE":
         if not is_owner:
             # Save-As from a share link would create an owner-owned file from
-            # a guest action.  Refused — CheckFileInfo also advertises
-            # UserCanNotWriteRelative for share callers, so coolwsd shouldn't
-            # even offer it.
-            app.logger.info("declining share-caller PUT_RELATIVE on file %s", file_id)
-            return Response("Save As is not available for share links", status=501)
+            # a guest action.  Forbidden (403, not 501) — the operation IS
+            # implemented, this caller just isn't allowed it; CheckFileInfo
+            # also advertises UserCanNotWriteRelative for share callers, so
+            # coolwsd shouldn't even offer it.
+            app.logger.info("denying share-caller PUT_RELATIVE on file %s", file_id)
+            abort(403, description="only the owner can create a copy (Save As)")
         return await _wopi_put_relative(row)
 
     app.logger.warning(
