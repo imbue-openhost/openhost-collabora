@@ -640,11 +640,11 @@ async def wopi_check_file_info(file_id: str):
             "UserFriendlyName": caller["user_friendly_name"],
             "UserCanWrite": caller["can_write"],
             # Capability advertisement — this is how the host tells coolwsd
-            # which write-family operations it may attempt.  Only advertise
-            # what POST /wopi/files/<id> actually implements: rename, locks,
-            # in-place update.  Save-As (PutRelativeFile) is NOT implemented,
-            # so UserCanNotWriteRelative=True suppresses that affordance.
-            "UserCanRename": caller["can_write"],
+            # which write-family operations it may attempt.  Content editing
+            # (PutFile) + locks are available to any writer; but renaming and
+            # deleting are file-management, reserved for the owner so an
+            # edit-share guest can't rename/delete the owner's document.
+            "UserCanRename": caller.get("share_mode") is None,
             "SupportsRename": True,
             "SupportsLocks": True,
             "SupportsGetLock": True,
@@ -736,19 +736,28 @@ async def wopi_files_op(file_id: str):
     # Everything below mutates state or takes a lock — writers only.
     if not caller["can_write"]:
         abort(403, description="this share is read-only")
+    is_owner = caller.get("share_mode") is None
 
+    # Content editing + locks: any writer (owner or edit-share).
     if override == "LOCK":
         return _wopi_lock(file_id)
     if override == "UNLOCK":
         return _wopi_unlock(file_id)
     if override == "REFRESH_LOCK":
         return _wopi_refresh_lock(file_id)
+
+    # File-management: owner only.  Edit-share guests can change the bytes
+    # but not rename/delete/copy the owner's document.
     if override == "RENAME_FILE":
+        if not is_owner:
+            abort(403, description="only the owner can rename this document")
         return _wopi_rename(file_id, row)
     if override == "DELETE":
+        if not is_owner:
+            abort(403, description="only the owner can delete this document")
         return _wopi_delete(file_id)
     if override == "PUT_RELATIVE":
-        if caller.get("share_mode") is not None:
+        if not is_owner:
             # Save-As from a share link would create an owner-owned file from
             # a guest action.  Refused — CheckFileInfo also advertises
             # UserCanNotWriteRelative for share callers, so coolwsd shouldn't
